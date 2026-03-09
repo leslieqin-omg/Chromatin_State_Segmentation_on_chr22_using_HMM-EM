@@ -1,0 +1,1 @@
+# Chromatin-State-Segmentation-on-chr22-using-HMM-EM-Baum-Welch-
