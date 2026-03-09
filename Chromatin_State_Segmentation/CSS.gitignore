@@ -1,0 +1,26 @@
+# 1. macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# 2. R and RStudio workspace and history files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+.Rapp.history
+
+# 3. Large raw data files (Crucial)
+# GitHub has a strict 100MB file size limit. 
+# BigWig files are usually too large and will cause the push to fail.
+*.BigWig
+*.bw
+*.bedGraph
+data/*.BigWig
+
+# 4. Dynamically generated files or caches (Optional)
+# Uncomment the lines below if you want to ignore generated plots/documents
+# *.pdf
+# *.svg
+*.html
