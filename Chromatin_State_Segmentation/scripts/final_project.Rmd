@@ -1,0 +1,1373 @@
+---
+title: "Untitled"
+author: "qinhaifeng"
+date: "2025-12-25"
+output: word_document
+---
+
+```{r}
+library(rtracklayer)
+library(GenomicRanges)
+library(depmixS4)
+library(ggplot2)
+library(reshape2)
+
+# ==========================================
+# 1. 高效读取与 Binning (已修复版)
+# ==========================================
+
+# 定义感兴趣的区域 (chr22 全长)
+chrom_name <- "chr22"
+seq_len_chr22 <- 50818468 
+gr_chr22 <- GRanges(seqnames = chrom_name, ranges = IRanges(1, seq_len_chr22))
+
+# 设定 Bin size
+bin_size <- 200
+
+# 生成 Bins
+bins <- tileGenome(seqlengths = setNames(seq_len_chr22, chrom_name), 
+                   tilewidth = bin_size, 
+                   cut.last.tile.in.chrom = TRUE)
+
+# 👇👇👇 这里是修改过的新函数 👇👇👇
+get_binned_signal <- function(bw_file, bins) {
+  message(paste("Processing:", bw_file))
+  
+  # 1. 导入 BigWig
+  bw_gr <- import.bw(bw_file, selection = BigWigSelection(bins))
+  
+  # 2. 计算 Coverage
+  score_rle_list <- tryCatch({
+    coverage(bw_gr, weight = "score")
+  }, error = function(e) {
+    message(paste("Error in coverage calculation for", bw_file))
+    return(NULL)
+  })
+  
+  if (is.null(score_rle_list)) return(NULL)
+  
+  # ⭐ 关键修复在这里 ⭐
+  # 强行让 score_rle_list 只保留 bins 里有的染色体 (即只保留 chr22)
+  score_rle_list <- score_rle_list[seqlevels(bins)]
+  
+  # 3. 计算每个 bin 的平均信号
+  binned_scores <- binnedAverage(bins, score_rle_list, "score")
+  
+  return(binned_scores$score)
+}
+# 👆👆👆 修改结束 👆👆👆
+
+bw_files <- list(
+  "H3K4me3"  = "data/H3K4me3.BigWig", 
+  "H3K27ac"  = "data/H3K27ac.BigWig",
+  "H3K36me3" = "data/H3K36me3.BigWig"
+)
+
+# 批量处理 (现在运行这一行应该几秒钟就搞定)
+signal_list <- lapply(bw_files, get_binned_signal, bins = bins)
+
+# 拼接矩阵
+X_raw <- do.call(cbind, signal_list)
+
+# ==========================================
+# 2. 统计预处理 (Log + Z-score)
+# ==========================================
+
+# ⭐ Method 描述重点：
+# 1. Log1p transformation to stabilize variance (stabilizing extreme peaks).
+# 2. Z-score standardization so all tracks contribute equally to the multivariate Gaussian.
+
+X_log <- log1p(X_raw) # log(x+1) 避免 0 值报错
+X <- scale(X_log)     # Z-score
+
+# 检查数据 (N_bins x 3)
+head(X)
+dim(X)
+
+# ==========================================
+# 3. HMM 模型训练 (Multivariate Gaussian)
+# ==========================================
+
+# 准备数据框
+df_hmm <- as.data.frame(X)
+colnames(df_hmm) <- c("H3K4me3", "H3K27ac", "H3K36me3")
+
+# 设定状态数 (K=4: Promoter, Enhancer, Transcribed, Background)
+K <- 4
+
+# ⭐ depmixS4 多元高斯标准写法：
+# family 需要是一个 list，对应每一列数据
+# 这种写法隐含假设：在给定状态 k 下，三个标记的信号是独立的 (Diagonal Covariance)
+# 也就是 P(X|Z) = P(H3K4me3|Z) * P(H3K27ac|Z) * P(H3K36me3|Z)
+mod <- depmix(
+  list(H3K4me3 ~ 1, H3K27ac ~ 1, H3K36me3 ~ 1), 
+  data = df_hmm, 
+  nstates = K, 
+  family = list(gaussian(), gaussian(), gaussian()) 
+)
+
+message("Fitting HMM... (This may take a few minutes)")
+# 使用 EM 算法 (Baum-Welch)
+fit_mod <- fit(mod)
+
+# 输出模型收敛信息
+summary(fit_mod)
+
+# ==========================================
+# 4. 解码与结果提取
+# ==========================================
+
+# Viterbi 解码得到状态序列
+# posterior() 函数会返回状态概率和 Viterbi 路径
+post_probs <- posterior(fit_mod)
+state_labels <- post_probs$state
+
+# 将状态结果贴回 GRanges 对象，方便后续操作
+mcols(bins) <- cbind(mcols(bins), as.data.frame(X), state = factor(state_labels))
+
+
+```
+
+
+
+
+```{r}
+# ==========================================
+# 5. 高级可视化 (论文级图表)
+# ==========================================
+
+# (1) 状态发射矩阵热图 (Emission Parameters)
+# 我们需要提取每个状态下，每个 mark 的 Mean
+params <- getpars(fit_mod)
+# depmix 的参数提取比较乱，手动聚合一下均值更稳：
+state_means <- aggregate(df_hmm, by=list(State=state_labels), FUN=mean)
+rownames(state_means) <- state_means$State
+state_means_mat <- as.matrix(state_means[,-1])
+
+# 画 Heatmap
+pdf("Figure_EmissionHeatmap.pdf", width = 6, height = 10)
+par(mar = c(6, 6, 5, 2))  # 下 左 上 右，保证不裁剪
+heatmap(state_means_mat, Rowv = NA, Colv = NA, scale="none", 
+        main="Emission Matrix (Z-score Means)", 
+        col=colorRampPalette(c("white", "red"))(50))
+dev.off()
+
+
+
+
+
+# ===== 先算每个 state 的活性（用三条 mark 的均值和）=====
+state_means_df <- aggregate(df_hmm, by = list(State = state_labels), FUN = mean)
+state_means_df$activity <- rowSums(state_means_df[, c("H3K4me3", "H3K27ac", "H3K36me3")])
+
+# 活性从低到高的 state 顺序（例如：2,4,1,3）
+state_order_low_to_high <- state_means_df$State[order(state_means_df$activity)]
+
+# ===== 颜色从低到高：白 灰 粉 红（你想要的）=====
+palette_low_to_high <- c("lightgray", "pink", "red", "darkred")
+
+# 关键：names 必须和数据里的 state 值完全一致
+state_colors <- setNames(
+  palette_low_to_high,
+  paste0("State ", state_order_low_to_high)
+)
+
+# ===== 关键修复：把 bins 里的 state 改成 "State 1" 这种格式 =====
+mcols(bins)$state <- factor(
+  paste0("State ", state_labels),
+  levels = names(state_colors)   # 保证图例顺序就是你定义的颜色顺序
+)
+
+# (2) 基因组轨迹可视化 (Gviz 包是画图神器，如果没有就用 ggplot)
+# 这里用 ggplot 手写一个简单的 Track 图
+subset_idx <- 10000:10500 # 选一段有趣的区域 (100kb 左右)
+subset_data <- as.data.frame(mcols(bins)[subset_idx, ])
+subset_data$pos <- start(bins)[subset_idx]
+
+# 长宽转换以便画图
+melted_data <- melt(
+  subset_data,
+  id.vars = c("pos", "state"),
+  measure.vars = c("H3K4me3", "H3K27ac", "H3K36me3")
+)
+state_levels <- names(state_colors)
+
+# 只用于“撑开图例”的 dummy 数据：每个 state 给一条记录
+legend_dummy <- data.frame(
+  pos   = min(subset_data$pos),
+  y     = -2,
+  state = factor(state_levels, levels = state_levels)
+)
+
+pdf("segmentation_silence.pdf", width = 10, height = 8) 
+ggplot() +
+  geom_line(data=melted_data, aes(x=pos, y=value, color=variable), alpha=0.8) +
+  geom_tile(data=subset_data, aes(x=pos, y=-2, fill=state), height=0.5) +
+
+  # ✅ 关键：加一个透明图层，只为了让图例包含所有 state
+  geom_tile(
+    data = legend_dummy,
+    aes(x = pos, y = y, fill = state),
+    height = 0.5,
+    alpha = 0,                 # 不显示在图上
+    inherit.aes = FALSE,
+    show.legend = TRUE
+  ) +
+
+  scale_fill_manual(
+    values = state_colors,
+    limits = state_levels,
+    breaks = state_levels,
+    drop   = FALSE,
+    name   = "HMM State"
+  ) +
+  guides(fill = guide_legend(override.aes = list(alpha = 1))) +  # 图例里强制不透明
+  theme_bw() +
+  labs(title="Chromatin State Segmentation (chr22 subset)",
+       y="Normalized Signal (Z-score)", x="Genomic Position")
+dev.off()
+
+
+
+
+# ==========================================
+# 自动寻找"最好看"的区域 (High Signal Region)
+# ==========================================
+
+# 1) 找到 H3K4me3 峰值 bin
+max_idx <- which.max(mcols(bins)$H3K4me3)
+
+# 2) 以峰值为中心 ±100 bins
+plot_start <- max(1, max_idx - 100)
+plot_end   <- min(length(bins), max_idx + 100)
+subset_idx <- plot_start:plot_end
+
+# 3) 准备绘图数据
+subset_data <- as.data.frame(mcols(bins)[subset_idx, ])
+subset_data$pos <- start(bins)[subset_idx]
+
+melted_data <- melt(
+  subset_data,
+  id.vars = c("pos", "state"),
+  measure.vars = c("H3K4me3", "H3K27ac", "H3K36me3")
+)
+
+# ==========================================
+# ✅ 关键：统一 state 的 levels & 颜色（用你刚刚那套 state_colors）
+# ==========================================
+
+# 如果你前面已经算过 state_colors，就直接用；
+# 否则请确保 state_colors 已在环境里，且 names(state_colors) 是 "State 4" 这种格式
+
+state_levels <- names(state_colors)
+
+# 确保这一段数据里的 state 也是 "State X" 形式，并按你定义的顺序做 factor
+subset_data$state <- factor(as.character(subset_data$state), levels = state_levels)
+
+# 只用于“撑开图例”的 dummy 数据：每个 state 给一条记录（不影响画面）
+legend_dummy <- data.frame(
+  pos   = min(subset_data$pos),
+  y     = min(melted_data$value, na.rm = TRUE) - 0.5,
+  state = factor(state_levels, levels = state_levels)
+)
+
+# 画图
+pdf("segmentation_active.pdf", width = 10, height = 8) 
+ggplot() +
+  geom_line(
+    data = melted_data,
+    aes(x = pos, y = value, color = variable),
+    size = 0.8, alpha = 0.9
+  ) +
+
+  # 状态条带
+  geom_tile(
+    data = subset_data,
+    aes(x = pos, y = min(melted_data$value, na.rm = TRUE) - 0.5, fill = state),
+    height = 0.5
+  ) +
+
+  # ✅ 透明图层：强制图例显示所有 state 的色块
+  geom_tile(
+    data = legend_dummy,
+    aes(x = pos, y = y, fill = state),
+    height = 0.5,
+    alpha = 0,
+    inherit.aes = FALSE,
+    show.legend = TRUE
+  ) +
+
+  scale_fill_manual(
+    values = state_colors,
+    limits = state_levels,
+    breaks = state_levels,
+    drop = FALSE,
+    name = "HMM State"
+  ) +
+  guides(fill = guide_legend(override.aes = list(alpha = 1))) +
+
+  theme_bw() +
+  labs(
+    title = paste("Chromatin State Segmentation (Active Region around bin", max_idx, ")"),
+    y = "Normalized Signal (Z-score)",
+    x = "Genomic Position"
+  )
+dev.off()
+# ==========================================
+# 6. (可选) 保存结果用于 enrichment 分析
+# ==========================================
+# 导出为 BED 文件，可以直接上传到 UCSC Genome Browser 查看
+export.bed(bins, "K562_HMM_Segmentation.bed")
+
+
+```
+
+```{r}
+# ==========================================
+# 7. (强力修复版) 最终验证：计算状态与已知注释的富集度
+# ==========================================
+library(GenomicFeatures)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(GenomeInfoDb)
+library(ggplot2) # 用 ggplot2 画更漂亮的图
+
+# 1. 获取 Promoter 并进行严格清洗
+message("正在获取 Promoter 数据...")
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+promoters_gr <- promoters(txdb, upstream=2000, downstream=2000)
+
+# 强制统一命名风格为 UCSC (即 "chr1", "chr22"...)
+seqlevelsStyle(promoters_gr) <- "UCSC" 
+# 只保留 chr22，并修剪越界坐标
+promoters_gr <- keepSeqlevels(promoters_gr, "chr22", pruning.mode="coarse")
+promoters_gr <- trim(promoters_gr)
+
+# 2. 准备 HMM 结果 (bins)
+bins_gr <- bins # 复制一份，避免修改原数据
+mcols(bins_gr)$state <- factor(state_labels)
+seqlevelsStyle(bins_gr) <- "UCSC" # 强制 bins 也用 UCSC 风格
+
+# --- 🔍 诊断信息 (运行后请查看控制台输出) ---
+message("---------------- DIAGNOSTICS ----------------")
+message(paste("Promoter 数量 (chr22):", length(promoters_gr)))
+message(paste("Bins 数量 (chr22):", length(bins_gr)))
+# 检查是否真的有重叠 (只检查 State 1)
+test_overlap <- intersect(bins_gr[bins_gr$state == 1], promoters_gr, ignore.strand=TRUE)
+message(paste("测试 State 1 与 Promoter 的重叠碱基数:", sum(width(test_overlap))))
+if(sum(width(test_overlap)) == 0) {
+  warning("⚠️ 警告：重叠数仍为 0！请检查数据源是否对应 hg38。")
+} else {
+  message("✅ 成功检测到重叠！可以绘图。")
+}
+message("---------------------------------------------")
+
+# 3. 定义计算函数 (增加 ignore.strand=TRUE)
+calc_enrichment <- function(state_k, bins_gr, feature_gr) {
+  # 找出属于 State k 的所有 bins
+  state_bins <- bins_gr[bins_gr$state == state_k]
+  len_state <- sum(width(state_bins))
+  if (len_state == 0) return(0)
+  
+  # ⭐ 关键修改：加上 ignore.strand=TRUE，防止因正负链导致的计算漏失
+  overlap <- intersect(state_bins, feature_gr, ignore.strand=TRUE)
+  len_overlap <- sum(width(overlap))
+  
+  # 背景概率 calculation
+  total_genome_len <- seqlengths(bins_gr)["chr22"]
+  # reduce 合并重叠的 promoter 区域，避免重复计算
+  feature_total_len <- sum(width(reduce(feature_gr, ignore.strand=TRUE)))
+  
+  background_prob <- feature_total_len / total_genome_len
+  observed_prob <- len_overlap / len_state
+  
+  return(observed_prob / background_prob)
+}
+
+# 循环计算
+enrichment_scores <- sapply(1:4, calc_enrichment, bins_gr=bins_gr, feature_gr=promoters_gr)
+
+# 打印结果数值
+print(enrichment_scores)
+
+# 4. 使用 ggplot2 绘图 (Publication Quality)
+df_plot <- data.frame(
+  State = factor(paste("State", 1:4), levels = paste("State", 1:4)),
+  Enrichment = enrichment_scores
+)
+
+# ===== 根据 Z-score means 排序并分配颜色（低->高：白 灰 粉 红）=====
+state_means_df <- aggregate(df_hmm, by = list(State = state_labels), FUN = mean)
+state_means_df$activity <- rowSums(state_means_df[, c("H3K4me3", "H3K27ac", "H3K36me3")])
+state_order_low_to_high <- state_means_df$State[order(state_means_df$activity)]
+
+palette_low_to_high <- c("white", "lightgray", "pink", "red")
+
+# 关键修复：名字必须是 "State 1" 这种格式，才能匹配 fill 的值
+state_colors <- setNames(palette_low_to_high, paste("State", state_order_low_to_high))
+
+pdf("TSS_enrich_validation.pdf", width = 10, height = 8) 
+ggplot(df_plot, aes(x = State, y = Enrichment, fill = State)) +
+  geom_col(color = "black", width = 0.7) + 
+  scale_fill_manual(values = state_colors) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "blue", size = 1) +
+  annotate("text", x = 3.5, y = 2, label = "Random (Fold=1)", color = "blue") +
+  theme_classic() +
+  labs(title = "Functional Validation: Enrichment at TSS",
+       y = "Fold Enrichment", x = "HMM States") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+dev.off()
+
+```
+
+
+
+
+
+```{r}
+# ==========================================
+# 8. (防弹版) 绝杀验证：计算与 CpG Islands 的富集度
+# ==========================================
+library(GenomicRanges)
+library(ggplot2)
+
+# 1. 直接从 UCSC GoldenPath 下载 CpG 数据 (绕过 API 错误)
+message("正在直接下载 CpG Islands 数据 (防弹模式)...")
+url <- "http://hgdownload.cse.ucsc.edu/goldenpath/hg38/database/cpgIslandExt.txt.gz"
+temp_file <- tempfile()
+# 下载文件 (几秒钟)
+download.file(url, temp_file, quiet = TRUE)
+
+# 2. 读取并转换为 GRanges
+# cpgIslandExt 文件的格式：第2列=chrom, 第3列=start, 第4列=end
+cpg_df <- read.table(temp_file, sep="\t", stringsAsFactors=FALSE)
+cpg_gr <- GRanges(
+  seqnames = cpg_df[, 2], 
+  ranges = IRanges(start = cpg_df[, 3], end = cpg_df[, 4])
+)
+
+# 3. 清洗数据 (只保留 chr22)
+# 统一命名风格
+seqlevelsStyle(cpg_gr) <- "UCSC" 
+# 只保留 chr22，并修剪越界坐标
+cpg_gr <- keepSeqlevels(cpg_gr, "chr22", pruning.mode="coarse")
+cpg_gr <- trim(cpg_gr)
+
+# 4. 复用之前的计算函数
+# 确保 calc_enrichment 函数已经在内存中，以下是之前定义的函数
+calc_enrichment <- function(state_k, bins_gr, feature_gr) {
+  # 找出属于 State k 的所有 bins
+  state_bins <- bins_gr[bins_gr$state == state_k]
+  len_state <- sum(width(state_bins))
+  if (len_state == 0) return(0)
+  
+  # 加上 ignore.strand=TRUE，防止因正负链导致的计算漏失
+  overlap <- intersect(state_bins, feature_gr, ignore.strand=TRUE)
+  len_overlap <- sum(width(overlap))
+  
+  # 背景概率 calculation
+  total_genome_len <- seqlengths(bins_gr)["chr22"]
+  # 合并重叠的 CpG 区域，避免重复计算
+  feature_total_len <- sum(width(reduce(feature_gr, ignore.strand=TRUE)))
+  
+  background_prob <- feature_total_len / total_genome_len
+  observed_prob <- len_overlap / len_state
+  
+  return(observed_prob / background_prob)
+}
+
+# 计算 CpG 富集度
+enrichment_cpg <- sapply(1:4, calc_enrichment, bins_gr=bins_gr, feature_gr=cpg_gr)
+
+# 打印数值 (State 1 应该非常高)
+print(enrichment_cpg)
+
+# 5. 绘图 (Figure 4)
+df_cpg <- data.frame(
+  State = factor(paste("State", 1:4), levels = paste("State", 1:4)),
+  Enrichment = enrichment_cpg
+)
+
+
+
+pdf("CpG_Islands_validation.pdf", width = 10, height = 8) 
+ggplot(df_cpg, aes(x = State, y = Enrichment, fill = State)) +
+  geom_col(color = "black", width = 0.7) + 
+  scale_fill_manual(values = state_colors) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "blue", size = 1) +
+  
+  # 添加标注
+  annotate("text", x = 3.5, y = 2, label = "Random (Fold=1)", color = "blue") +
+  
+  theme_classic() +
+  labs(title = "Validation against CpG Islands",
+       y = "Fold Enrichment", x = "HMM States") +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+    axis.text = element_text(size = 12, color = "black")
+  )
+dev.off()
+```
+
+```{r}
+# ==========================================
+# 10. Gene body enrichment（沿用 calc_enrichment 风格）
+# ==========================================
+library(GenomicFeatures)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene)
+library(GenomeInfoDb)
+library(GenomicRanges)
+library(ggplot2)
+
+# ---------- (0) 确保 bins_gr 和 calc_enrichment 已经存在 ----------
+# bins_gr: 你的 bins（chr22）+ mcols(state)
+# calc_enrichment: 你之前定义的函数
+
+# ---------- (1) 构建 chr22 gene bodies ----------
+txdb <- TxDb.Hsapiens.UCSC.hg38.knownGene
+
+message("正在获取 gene bodies (hg38 knownGene)...")
+
+# genes() 给出每个 gene 的整体范围（包含 intron/exon 的 union 范围）
+genes_gr <- genes(txdb)
+
+# 统一成 UCSC 风格并只保留 chr22
+seqlevelsStyle(genes_gr) <- "UCSC"
+genes_gr <- keepSeqlevels(genes_gr, "chr22", pruning.mode = "coarse")
+genes_gr <- trim(genes_gr)
+
+# 可选：去掉 promoter 区域（TSS ± 2kb），避免 gene body enrichment 被 promoter 影响
+message("正在构建 promoter 并从 gene body 中剔除 (TSS±2kb)...")
+promoters_gr2 <- promoters(txdb, upstream = 2000, downstream = 2000)
+seqlevelsStyle(promoters_gr2) <- "UCSC"
+promoters_gr2 <- keepSeqlevels(promoters_gr2, "chr22", pruning.mode="coarse")
+promoters_gr2 <- trim(promoters_gr2)
+
+# gene_body_noProm = genes - promoters
+# 注意 setdiff 可能产生很多碎片区间，所以最后 reduce
+gene_body_gr <- suppressWarnings(setdiff(genes_gr, promoters_gr2, ignore.strand = TRUE))
+gene_body_gr <- reduce(gene_body_gr, ignore.strand = TRUE)
+
+message(paste("chr22 genes ranges:", length(genes_gr)))
+message(paste("chr22 promoter ranges:", length(promoters_gr2)))
+message(paste("chr22 gene-body(no promoter) ranges after reduce:", length(gene_body_gr)))
+message(paste("Total gene-body length (bp):", sum(width(gene_body_gr))))
+
+# ---------- (2) 计算各状态对 gene body 的 fold enrichment ----------
+enrichment_gene_body <- sapply(1:4, calc_enrichment, bins_gr = bins_gr, feature_gr = gene_body_gr)
+
+print(enrichment_gene_body)
+
+df_gene_body <- data.frame(
+  State = factor(paste("State", 1:4), levels = paste("State", 1:4)),
+  GeneBody_Enrichment = enrichment_gene_body
+)
+
+# ---------- (3) 画图（Publication style，与你前两张一致） ----------
+pdf("gene_bady_validation.pdf", width = 10, height = 8) 
+ggplot(df_gene_body, aes(x = State, y = GeneBody_Enrichment, fill = State)) +
+  geom_col(color = "black", width = 0.7) +
+  scale_fill_manual(values = state_colors) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "blue", size = 1) +
+  annotate("text", x = 3.5, y = max(df_gene_body$GeneBody_Enrichment) * 0.9,
+           label = "Random (Fold=1)", color = "blue") +
+  theme_classic() +
+  labs(title = "Validation: Enrichment in Gene Bodies (excluding TSS±2kb)",
+       y = "Fold Enrichment", x = "HMM States") +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+dev.off()
+```
+
+
+
+
+
+
+
+
+```{r}
+# ==========================================
+# 9. (更新版) 模型“体检”诊断 + 汇总到 CSV
+#   新增：Gene body enrichment
+# ==========================================
+
+message("=== Diagnostic & Summary (Updated) ===")
+
+# ---------- 1) 富集度数值对比：TSS / CpG / GeneBody ----------
+message("\n--- 1. Enrichment comparison: TSS vs CpG vs GeneBody ---")
+
+enrichment_comparison <- data.frame(
+  State = paste("State", 1:4),
+  TSS_Enrichment      = round(enrichment_scores, 2),
+  CpG_Enrichment      = round(enrichment_cpg, 2),
+  GeneBody_Enrichment = round(enrichment_gene_body, 2)
+)
+print(enrichment_comparison)
+
+# ---------- 2) CpG 数据检查（保留你原来的） ----------
+message("\n--- 2. CpG data sanity check ---")
+message(paste("chr22 CpG islands count:", length(cpg_gr)))
+
+# ---------- 3) 状态覆盖率（Genomic coverage） ----------
+message("\n--- 3. State genomic coverage ---")
+state_counts <- table(state_labels)
+
+# 强制按 1:4 顺序对齐（防止某个 state 恰好没出现导致错位）
+state_counts <- state_counts[as.character(1:4)]
+state_counts[is.na(state_counts)] <- 0
+
+state_pct <- round(as.numeric(state_counts) / sum(state_counts) * 100, 1)
+
+coverage_results <- data.frame(
+  State   = paste("State", 1:4),
+  Count   = as.numeric(state_counts),
+  Percent = state_pct
+)
+print(coverage_results)
+
+# ---------- 4) 状态定义：每个 state 的观测均值（Emission means from data） ----------
+message("\n--- 4. Emission means (computed from data) ---")
+
+state_means_df <- aggregate(df_hmm, by = list(State = state_labels), FUN = mean)
+
+# 防止某个 state 缺失：补齐 State 1..4
+state_means_df$State <- as.character(state_means_df$State)
+all_states <- data.frame(State = as.character(1:4))
+state_means_df <- merge(all_states, state_means_df, by = "State", all.x = TRUE)
+
+# 保留2位小数
+state_means_df[, c("H3K4me3", "H3K27ac", "H3K36me3")] <- round(
+  state_means_df[, c("H3K4me3", "H3K27ac", "H3K36me3")],
+  2
+)
+
+# 统一列名与 State 格式
+colnames(state_means_df) <- c("State", "Mean_H3K4me3", "Mean_H3K27ac", "Mean_H3K36me3")
+state_means_df$State <- paste("State", state_means_df$State)
+
+print(state_means_df)
+
+# ---------- 5) 合并所有表格 -> Final summary ----------
+message("\n--- 5. Final summary table ---")
+
+final_summary <- Reduce(function(x, y) merge(x, y, by = "State", all = TRUE),
+                        list(enrichment_comparison, coverage_results, state_means_df))
+
+# 保持 State1..State4 顺序
+final_summary$State <- factor(final_summary$State, levels = paste("State", 1:4))
+final_summary <- final_summary[order(final_summary$State), ]
+final_summary$State <- as.character(final_summary$State)
+
+print(final_summary)
+
+# ---------- 6) 写入 CSV ----------
+write.csv(final_summary, "Final_Project_Summary_Metrics.csv", row.names = FALSE)
+message("\n✅ Updated summary saved to: Final_Project_Summary_Metrics.csv")
+
+
+
+# ==========================================
+# Table 1 (High-score version): State summary
+# Add: coverage bp, segment stats, self-transition prob, top mark
+# ==========================================
+
+# ---------- A) 基础表：enrichment（你已有） ----------
+enrichment_comparison <- data.frame(
+  State = paste("State", 1:4),
+  TSS_Enrichment      = round(enrichment_scores, 2),
+  CpG_Enrichment      = round(enrichment_cpg, 2),
+  GeneBody_Enrichment = round(enrichment_gene_body, 2)
+)
+
+# ---------- B) 覆盖率：bins 数、bp 数、百分比 ----------
+state_counts <- table(state_labels)
+state_counts <- state_counts[as.character(1:4)]
+state_counts[is.na(state_counts)] <- 0
+
+coverage_bins <- as.numeric(state_counts)
+coverage_bp <- coverage_bins * bin_size
+coverage_pct <- round(coverage_bins / sum(coverage_bins) * 100, 2)
+
+coverage_results <- data.frame(
+  State = paste("State", 1:4),
+  Coverage_Bins = coverage_bins,
+  Coverage_bp   = coverage_bp,
+  Coverage_Mb   = round(coverage_bp / 1e6, 3),
+  Coverage_Pct  = coverage_pct
+)
+
+# ---------- C) Emission means（从数据直接算，更稳） ----------
+state_means_df <- aggregate(df_hmm, by = list(State = state_labels), FUN = mean)
+state_means_df$State <- as.character(state_means_df$State)
+all_states <- data.frame(State = as.character(1:4))
+state_means_df <- merge(all_states, state_means_df, by = "State", all.x = TRUE)
+
+state_means_df[, c("H3K4me3", "H3K27ac", "H3K36me3")] <- round(
+  state_means_df[, c("H3K4me3", "H3K27ac", "H3K36me3")], 2
+)
+
+# Top mark（便于解释）
+get_top_mark <- function(row) {
+  vals <- c(row["H3K4me3"], row["H3K27ac"], row["H3K36me3"])
+  names(vals)[which.max(vals)]
+}
+top_mark <- apply(state_means_df[, c("H3K4me3","H3K27ac","H3K36me3")], 1, get_top_mark)
+
+state_means_df_out <- data.frame(
+  State = paste("State", state_means_df$State),
+  Mean_H3K4me3  = state_means_df$H3K4me3,
+  Mean_H3K27ac  = state_means_df$H3K27ac,
+  Mean_H3K36me3 = state_means_df$H3K36me3,
+  TopMark = top_mark
+)
+
+# ---------- D) 片段统计：rle 得到每段长度 ----------
+run <- rle(state_labels)
+
+seg_df <- data.frame(
+  state = as.character(run$values),
+  len_bins = run$lengths
+)
+
+# 每个 state：段数、段长统计
+seg_stats <- do.call(rbind, lapply(1:4, function(k) {
+  x <- seg_df$len_bins[seg_df$state == as.character(k)]
+  if (length(x) == 0) {
+    return(data.frame(
+      State = paste("State", k),
+      Num_Segments = 0,
+      Median_Segment_Length_Bins = NA,
+      Mean_Segment_Length_Bins   = NA,
+      Median_Segment_Length_bp   = NA,
+      Mean_Segment_Length_bp     = NA
+    ))
+  }
+  data.frame(
+    State = paste("State", k),
+    Num_Segments = length(x),
+    Median_Segment_Length_Bins = median(x),
+    Mean_Segment_Length_Bins   = round(mean(x), 2),
+    Median_Segment_Length_bp   = median(x) * bin_size,
+    Mean_Segment_Length_bp     = round(mean(x) * bin_size, 2)
+  )
+}))
+
+# ---------- E) Self-transition（从 Viterbi 路径计算经验转移概率） ----------
+K <- 4
+z <- as.integer(state_labels)
+
+# 经验转移计数
+trans_counts <- matrix(0, nrow = K, ncol = K,
+                       dimnames = list(paste0("State", 1:K), paste0("State", 1:K)))
+
+for (t in 2:length(z)) {
+  trans_counts[z[t-1], z[t]] <- trans_counts[z[t-1], z[t]] + 1
+}
+
+# 行归一化得到经验转移概率矩阵
+trans_prob <- prop.table(trans_counts, margin = 1)
+
+# self-transition = 对角线（状态保持概率）
+self_trans <- diag(trans_prob)
+
+self_trans_df <- data.frame(
+  State = paste("State", 1:K),
+  SelfTransition = round(self_trans, 3)
+)
+
+# （可选）如果你也想把整个转移矩阵保存下来：
+write.csv(round(trans_prob, 4), "Empirical_TransitionMatrix_Viterbi.csv")
+# ---------- F) 合并成 Table 1 ----------
+table1 <- Reduce(function(x, y) merge(x, y, by = "State", all = TRUE),
+                 list(enrichment_comparison, coverage_results, seg_stats, self_trans_df, state_means_df_out))
+
+# 排序
+table1$State <- factor(table1$State, levels = paste("State", 1:4))
+table1 <- table1[order(table1$State), ]
+table1$State <- as.character(table1$State)
+
+print(table1)
+
+# 写出 Table 1
+write.csv(table1, "Table1_State_Summary.csv", row.names = FALSE)
+message("✅ Table 1 saved to: Table1_State_Summary.csv")
+```
+
+
+
+```{r}
+# ==========================================
+# 10. (终极版) 模型选择 + 稳定性诊断
+# 输出：AIC, BIC, LogLik, Avg_Seg_Len, Min_State_Cov
+# 修复：自动对齐列数，避免 rbind 报错
+# 图表：4合1 拼图 (蓝线红点风格)
+# ==========================================
+
+library(depmixS4)
+library(ggplot2)
+library(gridExtra) # 用于拼图
+
+# --------- 0) 参数设置 ---------
+set.seed(123)
+
+subset_n   <- 5000       # 使用前 5k bins 加速 (正式跑可设为 nrow(df_hmm))
+n_restart  <- 10            # 每个 K 随机重启 10 次防局部最优
+k_values   <- 2:8           # 测试 K=2 到 K=8 (通常 8 足够看到拐点)
+
+# 截取数据子集
+df_subset <- df_hmm[1:min(subset_n, nrow(df_hmm)), , drop = FALSE]
+
+message(paste0("Running Model Selection on first ", nrow(df_subset), " bins..."))
+
+# --------- 1) 辅助函数：提取关键指标 ---------
+get_metrics <- function(fit_obj, df_len) {
+  # A. 基础模型指标
+  ll  <- as.numeric(logLik(fit_obj))
+  aic <- AIC(fit_obj)
+  bic <- BIC(fit_obj)
+  
+  # B. 解码状态 (Viterbi)
+  post_probs <- posterior(fit_obj)
+  z <- post_probs$state
+  
+  # C. 计算 Coverage (占比)
+  # 技巧：用 table 计算后转为百分比，取最小值作为"最稀有状态"
+  tab <- table(z)
+  cov_pcts <- as.numeric(tab) / df_len * 100
+  min_cov  <- min(cov_pcts) # 这里的最小值决定了是否有"废状态"
+  
+  # D. 计算 Stability (段长)
+  runs <- rle(z)
+  avg_len <- mean(runs$lengths) # 平均段长 (bins)
+  
+  return(list(LogLik=ll, AIC=aic, BIC=bic, Avg_Seg_Len=avg_len, Min_State_Cov=min_cov))
+}
+
+# --------- 2) 主循环 (K=2..8) ---------
+results_list <- list()
+
+for (k in k_values) {
+  message(paste0("--- Testing K = ", k, " (", n_restart, " restarts) ---"))
+  
+  best_fit <- NULL
+  best_ll  <- -Inf
+  best_metrics <- NULL
+  
+  # Restart 循环
+  for (r in 1:n_restart) {
+    set.seed(1000 + k*100 + r) # 确保随机性
+    
+    # 构造模型
+    mod_tmp <- depmix(
+      list(H3K4me3 ~ 1, H3K27ac ~ 1, H3K36me3 ~ 1),
+      data = df_subset,
+      nstates = k,
+      family = list(gaussian(), gaussian(), gaussian())
+    )
+    
+    # 拟合 (tryCatch 防止极个别不收敛报错)
+    fit_tmp <- tryCatch({
+      fit(mod_tmp, verbose = FALSE)
+    }, error = function(e) NULL)
+    
+    if (!is.null(fit_tmp)) {
+      ll_current <- logLik(fit_tmp)
+      
+      # 寻找当前 K 下的最佳 LogLik
+      if (ll_current > best_ll) {
+        best_ll  <- ll_current
+        best_fit <- fit_tmp
+      }
+    }
+  }
+  
+  # 获取最佳模型指标
+  if (!is.null(best_fit)) {
+    m <- get_metrics(best_fit, nrow(df_subset))
+    
+    # 存入 data.frame
+    results_list[[as.character(k)]] <- data.frame(
+      K = k,
+      Best_LogLik = m$LogLik,
+      AIC = m$AIC,
+      BIC = m$BIC,
+      Avg_Segment_Length = m$Avg_Seg_Len,
+      Min_State_Coverage = m$Min_State_Cov # 关键指标：最少那个状态占了多少%
+    )
+  }
+}
+
+# 汇总为大表格
+model_select_table <- do.call(rbind, results_list)
+
+# 保存 CSV
+write.csv(model_select_table, "Final_Model_Selection_Summary.csv", row.names = FALSE)
+print(model_select_table)
+
+# --------- 3) 论文级 4-Panel 可视化 (蓝线红点) ---------
+
+# 通用绘图主题设置
+my_theme <- theme_bw() + 
+  theme(plot.title = element_text(face = "bold", size = 11),
+        axis.title = element_text(size = 10))
+
+# 图 A: AIC
+p1 <- ggplot(model_select_table, aes(x = K, y = AIC)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(title = "A. Model Fit (AIC)", y = "AIC Score", x = NULL) + # x轴留空给下方图
+  my_theme
+
+# 图 B: BIC
+p2 <- ggplot(model_select_table, aes(x = K, y = BIC)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(title = "B. Model Fit (BIC)", y = "BIC Score", x = NULL) +
+  my_theme
+
+# 图 C: Stability (平均段长)
+p3 <- ggplot(model_select_table, aes(x = K, y = Avg_Segment_Length)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 3) +
+  labs(title = "C. Stability: Avg Segment Length", y = "Length (bins)", x = "Number of States (K)") +
+  scale_x_continuous(breaks = k_values) +
+  my_theme
+
+# 图 D: Redundancy (最小状态覆盖率)
+p4 <- ggplot(model_select_table, aes(x = K, y = Min_State_Coverage)) +
+  geom_line(color = "blue", size = 1) +    # 保持一致风格用线图，也可以用柱状图
+  geom_point(color = "red", size = 3) +
+  geom_hline(yintercept = 1, linetype = "dashed", color = "darkgray") + # 1% 阈值线
+  annotate("text", x = max(k_values), y = 1.5, label = "1% Threshold", color = "darkgray", size=3) +
+  labs(title = "D. Redundancy: Min State Size", y = "Min Coverage (%)", x = "Number of States (K)") +
+  scale_x_continuous(breaks = k_values) +
+  my_theme
+
+# 组合拼图 (2x2)
+final_plot <- grid.arrange(p1, p2, p3, p4, ncol = 2)
+
+# 保存图片
+ggsave("Figure_S1_Model_Selection_Dashboard.pdf", final_plot, width = 8, height = 6)
+
+message("\n✅ 运行完成！")
+message("1. 汇总表格已保存: Final_Model_Selection_Summary.csv")
+message("2. 拼图已保存: Figure_S1_Model_Selection_Dashboard.png")
+```
+
+```{r}
+library(pheatmap)
+library(reshape2)
+library(ggplot2)
+library(svglite)
+
+# ------------------------------------------------
+# B. 高级热图 (Clustered Heatmap)
+# ------------------------------------------------
+message("\n--- B. Generating Advanced Heatmap ---")
+
+state_means_final <- aggregate(df_hmm, by = list(State = state_labels), FUN = mean)
+rownames(state_means_final) <- paste("State", state_means_final$State)
+heatmap_mat <- as.matrix(state_means_final[, -1])
+
+colnames(heatmap_mat) <- c("Promoter (H3K4me3)", "Enhancer (H3K27ac)", "Gene Body (H3K36me3)")
+
+# pheatmap 返回的是一个对象（gtable），建议保存到变量，便于调试
+ph <- pheatmap(
+  heatmap_mat,
+  cluster_rows = TRUE,
+  cluster_cols = FALSE,
+  display_numbers = TRUE,
+  fontsize_number = 12,
+  color = colorRampPalette(c("white", "mistyrose", "red", "darkred"))(100),
+  main = "Emission Parameters: Clustered State Definition"
+)
+
+# ✅ 保存 pheatmap 到 PDF：用 pdf() 包住 + print(ph)
+pdf("Emission_Parameters.pdf", width = 10, height = 8)
+print(ph)
+dev.off()
+
+# ------------------------------------------------
+# C. Residual Analysis
+# ------------------------------------------------
+message("\n--- C. Residual Analysis ---")
+
+# 1) 计算残差
+pred_means <- state_means_final[match(state_labels, state_means_final$State), -1]
+residuals <- X - as.matrix(pred_means)
+colnames(residuals) <- c("Resid_H3K4me3", "Resid_H3K27ac", "Resid_H3K36me3")
+
+# 2) melt（写清列名，避免提示）
+resid_df <- reshape2::melt(
+  as.data.frame(residuals),
+  variable.name = "Mark",
+  value.name = "Residual"
+)
+
+# 3) 画图（先创建 p_resid 再保存）
+p_resid <- ggplot(resid_df, aes(x = Residual, fill = Mark)) +
+  geom_density(alpha = 0.5) +
+  theme_classic() +
+  coord_cartesian(xlim = c(-3, 3)) +   # ✅ 比 xlim() 更安全（不会丢数据导致奇怪问题）
+  labs(
+    title = "Model Diagnostics: Residual Distribution",
+    subtitle = "Ideally centered at 0 (Gaussian-ish)",
+    x = "Residual Value (Z-score)",
+    y = "Density"
+  )
+
+print(p_resid)  # ✅ 让 knit 在文档里显示图
+
+# 4) 保存 SVG（稳）
+svglite("Residual_Distribution.svg", width = 10, height = 8)
+print(p_resid)
+dev.off()
+```
+
+
+副图：
+```{r}
+library(ggplot2)
+library(reshape2)
+library(GenomicRanges)
+
+# ======================================================
+# 1. 智能选取绘图区域 (解决“横线”问题)
+# ======================================================
+
+# 假设 X_raw 和 X (Z-score后) 已经在内存中
+# 如果没有，请确保你已经运行了之前的读取和标准化代码
+
+# 1. 计算总活性 (三个标记之和)，找到信号最强的那个 bin
+total_signal <- rowSums(X_raw)
+peak_center  <- which.max(total_signal)
+
+# 2. 设定一个超大窗口：前后各 25000 bins (即 5Mb + 5Mb = 10Mb 区域)
+# 这样肯定能看到波峰波谷，不会只有一条线
+window_size <- 25000 
+start_idx   <- max(1, peak_center - window_size)
+end_idx     <- min(nrow(X_raw), peak_center + window_size)
+subset_idx  <- start_idx:end_idx
+
+message(paste("Selected Region Indices:", start_idx, "to", end_idx))
+message(paste("Region Width:", (end_idx - start_idx) * 200 / 1e6, "Mb"))
+
+# ======================================================
+# 2. 准备数据 DataFrame
+# ======================================================
+
+# --- A. 原始数据 (Raw) ---
+df_raw <- as.data.frame(X_raw[subset_idx, ])
+df_raw$position <- start(bins)[subset_idx]
+df_raw_long <- melt(df_raw, id.vars = "position", 
+                    variable.name = "Mark", value.name = "Signal")
+
+# --- B. 处理后数据 (Log1p + Z-score) ---
+# 注意：X 是你的标准化矩阵 (X <- scale(log1p(X_raw)))
+df_norm <- as.data.frame(X[subset_idx, ])
+df_norm$position <- start(bins)[subset_idx]
+df_norm_long <- melt(df_norm, id.vars = "position", 
+                     variable.name = "Mark", value.name = "Signal")
+
+# ======================================================
+# 3. 独立绘图与保存 (Visualizations)
+# ======================================================
+
+# --- 图 1: 原始数据轨迹 (Raw Data Track) ---
+p_track_raw <- ggplot(df_raw_long, aes(x = position/1e6, y = Signal, color = Mark)) +
+  geom_line(size = 0.3) + # 线条细一点，避免密集区域糊成一团
+  # 关键：Raw数据必须用 free_y，因为H3K4me3可能有几百，其他只有几十
+  facet_grid(Mark ~ ., scales = "free_y") +  
+  theme_bw() +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Raw Data Tracks (High Activity Region)", 
+       subtitle = "Note: Different Y-axis scales (Extreme Peaks visible)",
+       y = "Raw Signal Value", 
+       x = "Genomic Position (Mb)") +
+  theme(legend.position = "none") # 原始数据分面了，不需要图例
+
+print(p_track_raw)
+ggsave("Viz_1_Raw_Tracks.pdf", p_track_raw, width = 12, height = 6)
+
+
+# --- 图 2: 标准化数据轨迹 (Z-score Track) ---
+p_track_norm <- ggplot(df_norm_long, aes(x = position/1e6, y = Signal, color = Mark)) +
+  geom_line(size = 0.3) +
+  # 关键：Z-score 后量纲统一，不需要 free_y，可以直接对比谁强谁弱
+  facet_grid(Mark ~ .) +  
+  theme_bw() +
+  scale_color_brewer(palette = "Set1") +
+  labs(title = "Normalized Data Tracks (Log1p + Z-score)", 
+       subtitle = "Standardized to N(0,1) - Broad domains become visible",
+       y = "Z-score", 
+       x = "Genomic Position (Mb)") +
+  theme(legend.position = "none")
+
+print(p_track_norm)
+ggsave("Viz_2_Norm_Tracks.pdf", p_track_norm, width = 12, height = 6)
+
+
+# --- 图 3: 原始数据密度分布 (Raw Density) ---
+# 为了看清分布，我们可以用更多的数据点，或者就用这段区域的
+p_dist_raw <- ggplot(df_raw_long, aes(x = Signal, fill = Mark)) +
+  geom_density(alpha = 0.6) +
+  theme_classic() +
+  scale_fill_brewer(palette = "Set1") +
+  # 截断X轴：原始数据长尾太严重，只看 0-50 范围，否则全是平的
+  coord_cartesian(xlim = c(0, 50)) + 
+  labs(title = "Distribution: Raw Data", 
+       subtitle = "Highly skewed (Left-heavy), non-Gaussian",
+       x = "Raw Signal Value", y = "Density")
+
+print(p_dist_raw)
+ggsave("Viz_3_Raw_Density.pdf", p_dist_raw, width = 8, height = 6)
+
+
+# --- 图 4: 标准化数据密度分布 (Z-score Density) ---
+p_dist_norm <- ggplot(df_norm_long, aes(x = Signal, fill = Mark)) +
+  geom_density(alpha = 0.6) +
+  theme_classic() +
+  scale_fill_brewer(palette = "Set1") +
+  # 加一条标准正态分布虚线作为参考
+  stat_function(fun = dnorm, args = list(mean = 0, sd = 1), 
+                linetype = "dashed", color = "black", size = 0.8) +
+  labs(title = "Distribution: Log1p + Z-score", 
+       subtitle = "Approximates Gaussian (ready for HMM)",
+       x = "Z-score", y = "Density")
+
+print(p_dist_norm)
+ggsave("Viz_4_Norm_Density.pdf", p_dist_norm, width = 8, height = 6)
+
+```
+
+```{r}
+library(ggplot2)
+library(reshape2)
+library(corrplot) 
+library(gridExtra)
+
+# ========================================================
+# 参数设置
+# ========================================================
+K <- 4  # ✅ 修改：根据您的要求，设置状态数为 4
+z <- as.integer(state_labels) # 获取状态序列 (确保 state_labels 已在环境中)
+
+# ========================================================
+# Supp 1. 经验转移矩阵 (Empirical Transition Matrix)
+# ========================================================
+# 统计 Viterbi 路径中 1->1, 1->2 等跳转次数
+
+# 1. 统计跳转次数
+trans_mat <- matrix(0, nrow=K, ncol=K)
+rownames(trans_mat) <- colnames(trans_mat) <- paste("State", 1:K)
+
+for(i in 1:(length(z)-1)){
+  from <- z[i]
+  to   <- z[i+1]
+  trans_mat[from, to] <- trans_mat[from, to] + 1
+}
+
+# 2. 归一化 (让每一行加起来等于 1，即计算概率)
+trans_prob <- trans_mat / rowSums(trans_mat)
+
+# 3. 画热图并保存
+pdf("Supp_Transition_Matrix.pdf", width=7, height=6)
+corrplot(trans_prob, is.corr = FALSE, method = "color", 
+         addCoef.col = "black", # 显示具体数值
+         tl.col = "black", tl.srt = 45, 
+         col = colorRampPalette(c("white", "lightblue", "blue"))(100),
+         title = "Empirical Transition Probabilities", mar=c(0,0,2,0))
+dev.off()
+message("✅ Supp 1: Transition Matrix saved.")
+
+
+# ========================================================
+# Supp 2. 状态片段长度分布 (Segment Length Distribution)
+# ========================================================
+
+# 1. 计算每个片段的长度
+runs <- rle(as.integer(state_labels))
+df_seg <- data.frame(
+  State = factor(paste("State", runs$values), levels = paste("State", 1:K)),
+  Length_Bin = runs$lengths,
+  Length_bp = runs$lengths * 200 # 假设 bin_size = 200bp
+)
+
+# 2. 绘图 (使用 Log10 x轴)
+# 注意：这里需要您之前定义好的 state_colors (应包含 State 1 到 State 4 的颜色)
+p_seg_dist <- ggplot(df_seg, aes(x = Length_bp, fill = State)) +
+  geom_density(alpha = 0.7) +
+  scale_x_log10(labels = scales::comma) + # Log轴展示数量级差异
+  scale_fill_manual(values = state_colors) + # 使用您之前定义的颜色
+  theme_bw() +
+  labs(title = "Supplementary: Genomic Segment Length Distribution",
+       subtitle = "Distribution of chromatin state domain sizes",
+       x = "Segment Length (bp, log scale)", 
+       y = "Density") +
+  theme(legend.position = "bottom")
+
+ggsave("Supp_Segment_Length.pdf", p_seg_dist, width=8, height=6)
+message("✅ Supp 2: Segment Length Distribution saved.")
+
+
+# ========================================================
+# Supp 3. 原始标记相关性 (Input Correlation) - ✅ 已适配3个文件
+# ========================================================
+
+# 1. 检查输入矩阵 X 是否存在
+if (!exists("X")) {
+  stop("错误：环境中找不到矩阵 X。请先运行之前的 Log+Z-score 标准化代码生成 X。")
+}
+
+# 2. 计算相关矩阵 (Pearson)
+cor_mat <- cor(X) 
+
+# 3. ✅ 关键修改：只设置 3 个标记的名称，顺序必须对应 cbind 时的顺序
+mark_names <- c("H3K4me3", "H3K27ac", "H3K36me3")
+
+# 简单检查列数是否匹配
+if(ncol(cor_mat) != 3) {
+  warning(paste("注意：矩阵 X 的列数是", ncol(cor_mat), "，但我们只准备了 3 个名字。请检查 X 是否包含多余数据。"))
+  # 如果不匹配，尝试直接使用 X 原有的列名
+  if(!is.null(colnames(X))) {
+    colnames(cor_mat) <- rownames(cor_mat) <- colnames(X)
+  }
+} else {
+  colnames(cor_mat) <- rownames(cor_mat) <- mark_names
+}
+
+# 4. 画图并保存
+pdf("Supp_Data_Correlation.pdf", width=6, height=6)
+corrplot(cor_mat, method = "ellipse", type = "upper", 
+         addCoef.col = "black", 
+         tl.col = "black", tl.srt = 45,
+         title = "Correlation of Histone Marks (Input Data)", mar=c(0,0,2,0))
+dev.off()
+message("✅ Supp 3: Correlation Plot saved.")
+```
+
+
+
+
+
+
+
+```{r}
+library(rtracklayer)
+library(GenomicRanges)
+library(depmixS4)
+library(ggplot2)
+library(reshape2)
+library(gridExtra)
+
+# --- (A) 准备文件列表 (新增 H3K9me3) ---
+bw_files <- list(
+  "H3K4me3"  = "data/H3K4me3.BigWig",
+  "H3K27ac"  = "data/H3K27ac.BigWig",
+  "H3K36me3" = "data/H3K36me3.BigWig",
+  "H3K9me3"  = "data/H3K9me3.BigWig"  # <--- 新增的 Repressed Control
+)
+
+# --- (B) 你的 get_binned_signal 函数 (保持不变，省略不写) ---
+# ... (这里沿用你之前的 get_binned_signal 函数) ...
+
+# --- (C) 读取并标准化 ---
+message("Processing 4 marks (including H3K9me3)...")
+signal_list <- lapply(bw_files, get_binned_signal, bins = bins)
+
+# 拼接矩阵 (N x 4)
+X_raw <- do.call(cbind, signal_list)
+
+# Log + Z-score (标准化非常重要，让 H3K9me3 和 H3K4me3 有可比性)
+X_log <- log1p(X_raw)
+X <- scale(X_log)
+
+# 检查一下维度，应该是 N x 4
+print(head(X))
+
+
+# ==========================================
+# 2. HMM Fitting with Multiple Restarts
+# ==========================================
+
+# 准备数据框
+df_hmm <- as.data.frame(X)
+# 列名现在是：H3K4me3, H3K27ac, H3K36me3, H3K9me3
+
+# 设定状态数 (建议尝试 K=5，给 H3K9me3 一个独立状态)
+K <- 5 
+n_restarts <- 5  # 跑 5 次，取最好 (你要求的 multiple starts)
+
+message(paste0("Fitting HMM (K=", K, ") with ", n_restarts, " random starts..."))
+
+best_fit_mod <- NULL
+best_loglik  <- -Inf
+
+for (i in 1:n_restarts) {
+  
+  # 打印进度
+  message(paste("  >> Run", i, "/", n_restarts, "..."))
+  
+  # 1. 设定随机种子 (确保每次起点不同)
+  set.seed(100 + i)
+  
+  # 2. 定义模型 (注意：family 列表现在需要 4 个 gaussian)
+  mod_tmp <- depmix(
+    list(H3K4me3 ~ 1, H3K27ac ~ 1, H3K36me3 ~ 1, H3K9me3 ~ 1), 
+    data = df_hmm, 
+    nstates = K, 
+    family = list(gaussian(), gaussian(), gaussian(), gaussian()) 
+  )
+  
+  # 3. 拟合 (使用 tryCatch 防止个别随机起点导致不收敛报错)
+  fit_tmp <- tryCatch({
+    fit(mod_tmp, verbose = FALSE)
+  }, error = function(e) {
+    message("     Converge failed for this run, skipping.")
+    return(NULL)
+  })
+  
+  # 4. 比较 LogLik，保留最好的
+  if (!is.null(fit_tmp)) {
+    current_ll <- logLik(fit_tmp)
+    message(paste("     LogLik:", round(current_ll, 2)))
+    
+    if (current_ll > best_loglik) {
+      best_loglik  <- current_ll
+      best_fit_mod <- fit_tmp
+      message("     --> New Best Model found!")
+    }
+  }
+}
+
+message("------------------------------------------------")
+message(paste("✅ Final Model Selected. Best LogLik:", round(best_loglik, 2)))
+print(summary(best_fit_mod))
+
+# 提取最终状态
+final_probs <- posterior(best_fit_mod)
+state_labels <- final_probs$state
+
+# 把状态贴回 bins
+mcols(bins) <- cbind(mcols(bins), as.data.frame(X), state = factor(state_labels))
+
+# ==========================================
+# 3. 检查发射矩阵 (Emission Heatmap)
+# ==========================================
+
+# 计算每个状态的均值
+state_means <- aggregate(df_hmm, by=list(State=state_labels), FUN=mean)
+rownames(state_means) <- state_means$State
+state_means_mat <- as.matrix(state_means[,-1])
+
+# 打印数值矩阵，让你心里有数
+print("Emission Means (Z-score):")
+print(round(state_means_mat, 2))
+
+# 绘图
+# 注意：Colv=NA 保证列的顺序不乱，方便你通过列名看对应关系
+heatmap(state_means_mat, Rowv = NA, Colv = NA, scale="none", 
+        main=paste("Emission Matrix (K=", K, ")"),
+        col=colorRampPalette(c("white", "pink", "red", "darkred"))(50))
+
+
+```
