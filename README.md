@@ -1,6 +1,4 @@
-# Chromatin-State-Segmentation-on-chr22-using-HMM-EM-Baum-Welch-
-# HMM-based Chromatin State Segmentation
-
+# Chromatin State Segmentation on chr22 using HMM & EM（Baum-Welch）
 ## Overview
 This repository contains the code and methodology for unsupervised chromatin state segmentation on human chromosome 22 (hg38). Using continuous ChIP-seq bigWig tracks, the pipeline employs a multivariate Gaussian Hidden Markov Model (HMM) to convert noisy, bin-level epigenetic signals into interpretable, discrete regulatory annotations. 
 
